@@ -1,21 +1,25 @@
 package daemon
 
 import (
+	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/Est-Void/Vanta/api"
+	"github.com/Est-Void/Vanta/internal/llm"
+	"github.com/Est-Void/Vanta/internal/transport"
 )
 
-func newRouter(clients map[string][]api.AuthScope) http.Handler {
+func newRouter(d *deps) http.Handler {
 	mux := http.NewServeMux()
-	authed := requireAuth(clients, mux)
+	authed := requireAuth(d.clients, mux)
 
 	mux.HandleFunc("GET /v1/status", handleStatus)
 
 	mux.Handle("POST /v1/session",
-		requireScope(api.ScopeAgent, http.HandlerFunc(handleCreateSession)))
+		requireScope(api.ScopeAgent, http.HandlerFunc(d.handleCreateSession)))
 	mux.Handle("POST /v1/session/{id}/message",
-		requireScope(api.ScopeAgent, http.HandlerFunc(handleSendMessage)))
+		requireScope(api.ScopeAgent, http.HandlerFunc(d.handleSendMessage)))
 
 	mux.Handle("POST /v1/attachment",
 		requireScope(api.ScopeAgent, http.HandlerFunc(handleUploadAttachment)))
@@ -52,18 +56,32 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func handleCreateSession(w http.ResponseWriter, r *http.Request) {
+func (d *deps) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var req api.CreateSessionRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, api.ErrBadRequest, "invalid json")
 		return
 	}
-	writeError(w, api.ErrInternal, "not implemented")
+
+	id := fmt.Sprintf("sess-%d", time.Now().UnixNano())
+	title := req.Title
+	if title == "" {
+		title = "New session"
+	}
+	d.sessions.Create(id, title)
+
+	writeJSON(w, http.StatusOK, api.CreateSessionResult{
+		Session: api.Session{
+			ID:        id,
+			Title:     title,
+			CreatedAt: time.Now(),
+		},
+	})
 }
 
-func handleSendMessage(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
+func (d *deps) handleSendMessage(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("id")
+	if sessionID == "" {
 		writeError(w, api.ErrBadRequest, "missing session id")
 		return
 	}
@@ -72,7 +90,64 @@ func handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, api.ErrBadRequest, "invalid json")
 		return
 	}
-	writeError(w, api.ErrInternal, "not implemented")
+
+	sess := d.sessions.GetOrCreate(sessionID, "Chat")
+
+	if err := d.sessions.AddMessage(sessionID, api.RoleUser, req.Content); err != nil {
+		writeError(w, api.ErrNotFound, err.Error())
+		return
+	}
+
+	history := d.sessions.GetMessages(sessionID)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ctx := r.Context()
+	start := time.Now()
+
+	stream, err := d.llm.ChatStream(ctx, llm.Request{
+		Model:    d.model,
+		Messages: history,
+	})
+	if err != nil {
+		id := sess.NextEventID()
+		transport.WriteSSE(w, id, string(api.EvError), api.ErrorData{
+			Error: api.Error{Code: api.ErrInternal, Message: err.Error()},
+		})
+		transport.WriteSSE(w, sess.NextEventID(), string(api.EvDone), api.DoneData{
+			Duration: time.Since(start),
+			Err:      &api.Error{Code: api.ErrInternal, Message: err.Error()},
+		})
+		return
+	}
+
+	var fullContent string
+	var usage *api.TokenUsage
+	defer func() {
+		d.sessions.AddMessage(sessionID, api.RoleAgent, fullContent)
+		transport.WriteSSE(w, sess.NextEventID(), string(api.EvDone), api.DoneData{
+			Duration: time.Since(start),
+			Usage:    usage,
+		})
+	}()
+
+	for delta := range stream {
+		if delta.Content != "" {
+			fullContent += delta.Content
+			transport.WriteSSE(w, sess.NextEventID(), string(api.EvToken), api.TokenData{Text: delta.Content})
+		}
+		if delta.Usage != nil {
+			usage = &api.TokenUsage{
+				Prompt:     delta.Usage.PromptTokens,
+				Completion: delta.Usage.CompletionTokens,
+			}
+		}
+		if delta.FinishReason != "" {
+			break
+		}
+	}
 }
 
 func handleUploadAttachment(w http.ResponseWriter, r *http.Request) {
@@ -152,5 +227,9 @@ func handleVoiceTranscribe(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleEvents(w http.ResponseWriter, r *http.Request) {
-	writeError(w, api.ErrInternal, "not implemented")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	transport.WriteSSE(w, 1, string(api.EvDone), api.DoneData{})
 }

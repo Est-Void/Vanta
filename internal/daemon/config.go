@@ -13,38 +13,67 @@ type clientConfig struct {
 	Scopes []api.AuthScope `toml:"scopes"`
 }
 
-func loadClients() map[string][]api.AuthScope {
+type LLMConfig struct {
+	OllamaURL string `toml:"ollama_url"`
+	Model     string `toml:"model"`
+}
+
+type Config struct {
+	Clients []clientConfig `toml:"clients"`
+	LLM     LLMConfig      `toml:"llm"`
+}
+
+func loadConfig() Config {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return defaultClients()
+		return defaultConfig()
 	}
+	return loadConfigFrom(filepath.Join(home, ".config", "vanta", "config.toml"))
+}
 
-	path := filepath.Join(home, ".config", "vanta", "config.toml")
+func loadConfigFrom(path string) Config {
 	f, err := os.Open(path)
 	if err != nil {
-		return defaultClients()
+		return defaultConfig()
 	}
 	defer f.Close()
 
-	var cfg struct {
-		Clients []clientConfig `toml:"clients"`
-	}
+	var cfg Config
 	if _, err := toml.NewDecoder(f).Decode(&cfg); err != nil {
-		return defaultClients()
+		return defaultConfig()
 	}
 
-	clients := make(map[string][]api.AuthScope, len(cfg.Clients))
-	for _, c := range cfg.Clients {
-		clients[c.Token] = c.Scopes
+	if len(cfg.Clients) == 0 {
+		cfg.Clients = defaultConfig().Clients
 	}
-	if len(clients) == 0 {
-		return defaultClients()
+	if cfg.LLM.OllamaURL == "" {
+		cfg.LLM.OllamaURL = "http://localhost:11434"
 	}
-	return clients
+	if cfg.LLM.Model == "" {
+		cfg.LLM.Model = "llama3"
+	}
+	return cfg
 }
 
-func defaultClients() map[string][]api.AuthScope {
-	return map[string][]api.AuthScope{
-		"dev-token": {api.ScopeScreen, api.ScopeTerminal, api.ScopeDevice, api.ScopeInput, api.ScopeVoice, api.ScopeAgent},
+func defaultConfig() Config {
+	return Config{
+		Clients: []clientConfig{
+			{Token: "dev-token", Scopes: []api.AuthScope{
+				api.ScopeScreen, api.ScopeTerminal, api.ScopeDevice,
+				api.ScopeInput, api.ScopeVoice, api.ScopeAgent,
+			}},
+		},
+		LLM: LLMConfig{
+			OllamaURL: "http://localhost:11434",
+			Model:     "llama3",
+		},
 	}
+}
+
+func clientsFromConfig(cfg Config) map[string][]api.AuthScope {
+	m := make(map[string][]api.AuthScope, len(cfg.Clients))
+	for _, c := range cfg.Clients {
+		m[c.Token] = c.Scopes
+	}
+	return m
 }

@@ -9,10 +9,28 @@ import (
 	"os"
 	"syscall"
 	"time"
+
+	"github.com/Est-Void/Vanta/api"
+	"github.com/Est-Void/Vanta/internal/llm"
+	"github.com/Est-Void/Vanta/internal/transport"
 )
 
+type deps struct {
+	clients  map[string][]api.AuthScope
+	sessions *SessionStore
+	llm      llm.Provider
+	model    string
+}
+
 func Run(ctx context.Context) error {
-	clients := loadClients()
+	cfg := loadConfig()
+
+	d := &deps{
+		clients:  clientsFromConfig(cfg),
+		sessions: NewSessionStore(),
+		llm:      llm.NewOllama(cfg.LLM.OllamaURL),
+		model:    cfg.LLM.Model,
+	}
 
 	listener, err := listenSocket()
 	if err != nil {
@@ -21,7 +39,7 @@ func Run(ctx context.Context) error {
 	defer listener.Close()
 
 	server := &http.Server{
-		Handler:           newRouter(clients),
+		Handler:           newRouter(d),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -36,12 +54,7 @@ func Run(ctx context.Context) error {
 }
 
 func listenSocket() (net.Listener, error) {
-	dir, err := runtimeDir("vanta")
-	if err != nil {
-		return nil, fmt.Errorf("runtime dir: %w", err)
-	}
-
-	sock := dir + "/vanta.sock"
+	sock := transport.DefaultSocket()
 	os.Remove(sock)
 
 	l, err := net.Listen("unix", sock)
